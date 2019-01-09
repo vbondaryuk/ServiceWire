@@ -15,7 +15,7 @@ namespace DemoHost
     {
         static void Main(string[] args)
         {
-            var logger = new Logger(logLevel: LogLevel.Debug);
+            var logger = new Logger(logLevel: LogLevel.Debug, options: LogOptions.LogOnlyToConsole);
             var stats = new Stats();
 			 
             var addr = new[] { "127.0.0.1", "8098" }; //defaults

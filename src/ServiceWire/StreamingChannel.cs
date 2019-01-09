@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Security.Authentication;
@@ -18,6 +19,7 @@ namespace ServiceWire
         private readonly ParameterTransferHelper _parameterTransferHelper = new ParameterTransferHelper();
         private ServiceSyncInfo _syncInfo;
         private ZkCrypto _zkCrypto;
+        protected DuplexPipe _duplexPipe;
 
         // keep cached sync info to avoid redundant wire trips
         private static readonly ConcurrentDictionary<Type, ServiceSyncInfo> SyncInfoCache = new ConcurrentDictionary<Type, ServiceSyncInfo>(); 
@@ -29,7 +31,7 @@ namespace ServiceWire
 
         /// <summary>
         /// This method asks the server for a list of identifiers paired with method
-        /// names and -parameter types. This is used when invoking methods server side.
+        /// names and parameter types. This is used when invoking methods server side.
         /// </summary>
         protected override void SyncInterface(Type serviceType, 
             string username = null, string password = null)
@@ -133,6 +135,115 @@ namespace ServiceWire
                 _syncInfo = bytes.ToDeserializedObject<ServiceSyncInfo>();
                 SyncInfoCache.AddOrUpdate(serviceType, _syncInfo, (t, info) => _syncInfo);
             }
+        }
+        
+        protected async ValueTask SyncInterfaceAsync(Type serviceType, 
+            string username = null, string password = null)
+        {
+            if (!string.IsNullOrEmpty(username) && !string.IsNullOrEmpty(password))
+            {
+                var sw = Stopwatch.StartNew();
+                _logger.Debug("Zk authentiation started for: {0}, {1}", username, password);
+                //do zk protocol authentication
+                var sr = new ZkProtocol();
+
+                // Step 1. Client sends username and ephemeral hash of random number.
+                var aRand = sr.CryptRand();
+                var aClientEphemeral = sr.GetClientEphemeralA(aRand);
+                
+                // send username and aClientEphemeral to server
+                await _duplexPipe.WriteInt((int)MessageType.ZkInitiate);
+                await _duplexPipe.WriteString(username);
+                _logger.Debug("username sent to server: {0}", username);
+
+                await _duplexPipe.Output.WriteAsync(aClientEphemeral);//always 32 bytes
+                _logger.Debug("ClientEphemeral (A) sent to server: {0}", Convert.ToBase64String(aClientEphemeral));
+
+                // get response from server
+                bool userFound = await _duplexPipe.ReadBooleanAsync();
+                //var userFound = _binReader.ReadBoolean();
+                if (!userFound)
+                {
+                    _logger.Debug("User not found. InvalidCredentialException thrown.");
+                    throw new InvalidCredentialException("authentication failed");
+                }
+                var saltMemory = await _duplexPipe.ReadAsync(32);
+                var salt = saltMemory.ToArray();
+                _logger.Debug("Salt received from server: {0}", Convert.ToBase64String(salt));
+                var bServerEphemeralMemory = await _duplexPipe.ReadAsync(32);
+                var bServerEphemeral = bServerEphemeralMemory.ToArray();
+                _logger.Debug("ServerEphemeral (B) received from server: {0}", Convert.ToBase64String(bServerEphemeral));
+
+                // Step 3. Client and server calculate random scramble of ephemeral hash values exchanged.
+                var clientScramble = sr.CalculateRandomScramble(aClientEphemeral, bServerEphemeral);
+
+                // Step 4. Client computes session key
+                var clientSessionKey = sr.ClientComputeSessionKey(salt, username, password, 
+                    aClientEphemeral, bServerEphemeral, clientScramble);
+
+                // Step 6. Client creates hash of session key and sends to server. Server creates same key and verifies.
+                var clientSessionHash = sr.ClientCreateSessionHash(username, salt, aClientEphemeral,
+                    bServerEphemeral, clientSessionKey);
+                // send to server and server verifies
+                _binWriter.Write((int)MessageType.ZkProof);
+                _binWriter.Write(clientSessionHash); //always 32 bytes
+
+                _logger.Debug("ClientSessionKey Hash sent to server: {0}", Convert.ToBase64String(clientSessionHash));
+
+                // get response
+                var serverVerified = _binReader.ReadBoolean();
+                if (!serverVerified)
+                {
+                    _logger.Debug("Server verification failed. InvalidCredentialException thrown.");
+                    throw new InvalidCredentialException("authentication failed");
+                }
+                var serverSessionHash = _binReader.ReadBytes(32);
+                var clientServerSessionHash = sr.ServerCreateSessionHash(aClientEphemeral, 
+                    clientSessionHash, clientSessionKey);
+                if (!serverSessionHash.IsEqualTo(clientServerSessionHash))
+                {
+                    _logger.Debug("Server hash mismatch. InvalidCredentialException thrown. Has received: {0}", Convert.ToBase64String(serverSessionHash));
+                    throw new InvalidCredentialException("authentication failed");
+                }
+                _logger.Debug("Server Hash match. Received from server: {0}", Convert.ToBase64String(serverSessionHash));
+                _zkCrypto = new ZkCrypto(clientSessionKey, clientScramble);
+                _logger.Debug("Zk authentiation completed successfully.");
+                sw.Stop();
+                _stats.Log("ZkAuthentication", sw.ElapsedMilliseconds);
+            }
+            
+            if (!SyncInfoCache.TryGetValue(serviceType, out _syncInfo))
+            {
+                //write the message type
+                _binWriter.Write((int)MessageType.SyncInterface);
+                if (null != _zkCrypto)
+                {
+                    //sync interface with encryption
+                    var assemName = serviceType.FullName;
+                    var assemblyNameEncrypted = _zkCrypto.Encrypt(assemName.ConvertToBytes());
+                    _binWriter.Write(assemblyNameEncrypted.Length);
+                    _binWriter.Write(assemblyNameEncrypted);
+                }
+                else
+                {
+                    _binWriter.Write(serviceType.FullName);
+                }
+                //read sync data
+                var len = _binReader.ReadInt32();
+                //len is zero when AssemblyQualifiedName not same version or not found
+                if (len == 0) throw new TypeAccessException("SyncInterface failed. Type or version of type unknown.");
+                var bytes = _binReader.ReadBytes(len);
+                if (null != _zkCrypto)
+                {
+                    _logger.Debug("Encrypted data received from server: {0}", Convert.ToBase64String(bytes));
+                    bytes = _zkCrypto.Decrypt(bytes);
+                    _logger.Debug("Decrypted data received from server: {0}", Convert.ToBase64String(bytes));
+                }
+                _syncInfo = bytes.ToDeserializedObject<ServiceSyncInfo>();
+                SyncInfoCache.AddOrUpdate(serviceType, _syncInfo, (t, info) => _syncInfo);
+            }
+
+            //return default;
         }
 
         /// <summary>

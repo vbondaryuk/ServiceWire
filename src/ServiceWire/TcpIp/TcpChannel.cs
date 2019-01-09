@@ -86,9 +86,11 @@ namespace ServiceWire.TcpIp
             _stream = new BufferedStream(new NetworkStream(_client), 8192);
             _binReader = new BinaryReader(_stream);
             _binWriter = new BinaryWriter(_stream);
+            _duplexPipe = new DuplexPipe(new NetworkStream(_client));
             try
             {
-                SyncInterface(_serviceType, _username, _password);
+                SyncInterfaceAsync(_serviceType, _username, _password).GetAwaiter().GetResult();
+                //SyncInterface(_serviceType, _username, _password);
             }
             catch (Exception e)
             {
