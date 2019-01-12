@@ -64,18 +64,17 @@ namespace ServiceWire
                 list.AddRange(msg);
             }
             if (list.Count == 0) return; //nothing to log
-            var lines = list.ToArray();
             if (_options == LogOptions.LogOnlyToConsole || _options == LogOptions.LogToBoth)
             {
-                Console.Write(lines);
+                Console.WriteLine(string.Join(Environment.NewLine, list));
             }
             if (_options == LogOptions.LogOnlyToFile || _options == LogOptions.LogToBoth)
             {
-                WriteToFile(lines);
+                WriteToFile(list);
             }
         }
 
-        private void WriteToFile(string[] lines)
+        private void WriteToFile(IEnumerable<string> lines)
         {
             lock (_syncRoot)
             {

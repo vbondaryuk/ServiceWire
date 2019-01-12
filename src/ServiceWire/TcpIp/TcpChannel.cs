@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Runtime.Serialization.Formatters.Binary;
 using System.IO;
 using System.Threading;
+using ServiceWire.DuplexPipes;
 
 namespace ServiceWire.TcpIp
 {
@@ -42,7 +43,21 @@ namespace ServiceWire.TcpIp
                 serviceType, endpoint.EndPoint, endpoint.ConnectTimeOutMs);
         }
 
-        private void Initialize(string username, string password, 
+        private bool IsPipelines;
+        public TcpChannel(Type serviceType, TcpZkEndPoint endpoint, bool isPipeline)
+        {
+	        if (endpoint == null) throw new ArgumentNullException("endpoint");
+	        if (endpoint.Username == null) throw new ArgumentNullException("endpoint.Username");
+	        if (endpoint.Password == null) throw new ArgumentNullException("endpoint.Password");
+
+
+	        IsPipelines = isPipeline;
+			Initialize(endpoint.Username, endpoint.Password,
+		        serviceType, endpoint.EndPoint, endpoint.ConnectTimeOutMs);
+
+        }
+
+		private void Initialize(string username, string password, 
             Type serviceType, IPEndPoint endpoint, int connectTimeoutMs)
         {
             _username = username;
@@ -56,10 +71,10 @@ namespace ServiceWire.TcpIp
             {
                 RemoteEndPoint = endpoint
             };
-            connectEventArgs.Completed += new EventHandler<SocketAsyncEventArgs>((sender, e) =>
+            connectEventArgs.Completed += (sender, e) =>
             {
-                connected = true;
-            });
+	            connected = true;
+            };
 
             if (_client.ConnectAsync(connectEventArgs))
             {
@@ -82,28 +97,43 @@ namespace ServiceWire.TcpIp
             {
                 _client.Dispose();
                 throw new SocketException((int)SocketError.NotConnected);
-            } 
-            _stream = new BufferedStream(new NetworkStream(_client), 8192);
-            _binReader = new BinaryReader(_stream);
-            _binWriter = new BinaryWriter(_stream);
-            _duplexPipe = new DuplexPipe(new NetworkStream(_client));
-            try
+            }
+
+            if (IsPipelines)
             {
-                SyncInterfaceAsync(_serviceType, _username, _password).GetAwaiter().GetResult();
-                //SyncInterface(_serviceType, _username, _password);
+	            _duplexPipe = new DuplexPipe(new NetworkStream(_client));
+			}
+            else
+            {
+	            _stream = new BufferedStream(new NetworkStream(_client), 8192);
+	            _binReader = new BinaryReader(_stream);
+	            _binWriter = new BinaryWriter(_stream);
+			}
+//            
+            try
+			{
+				if (IsPipelines)
+				{
+					SyncInterfaceAsync(_serviceType, _username, _password);
+				}
+				else
+				{
+
+					SyncInterface(_serviceType, _username, _password);
+				}
             }
             catch (Exception e)
             {
-                this.Dispose(true);
+				this.Dispose(true);
                 throw;
             }
         }
 
-        public override bool IsConnected { get { return (null != _client) && _client.Connected; } }
+        public override bool IsConnected => _client?.Connected == true;
 
-        #region IDisposable override
+		#region IDisposable override
 
-        protected override void Dispose(bool disposing)
+		protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
             if (disposing)

@@ -9,7 +9,7 @@ namespace ServiceWire.ZeroKnowledge
             return Encoding.Unicode.GetBytes(val);
         }
 
-        public static string ConverToString(this byte[] bytes)
+        public static string ConvertToString(this byte[] bytes)
         {
             return Encoding.Unicode.GetString(bytes);
         }

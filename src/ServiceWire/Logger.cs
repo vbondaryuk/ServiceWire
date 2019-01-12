@@ -59,7 +59,7 @@ namespace ServiceWire
                 string msg = (null != args && args.Length > 0)
                     ? string.Format(formattedMessage, args)
                     : formattedMessage;
-                _logQueue.Enqueue(new string[] { string.Format("{0}\t{1}\t{2}", GetTimeStamp(), logLevel, msg) });
+                _logQueue.Enqueue(new[] {$"{GetTimeStamp()}\t{logLevel}\t{msg}"});
                 if (_logQueue.Count >= _messageBufferSize)
                     Task.Factory.StartNew(() => WriteBuffer(_messageBufferSize));
             }
