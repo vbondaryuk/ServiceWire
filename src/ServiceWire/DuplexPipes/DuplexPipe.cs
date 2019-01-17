@@ -10,213 +10,258 @@ using ServiceWire.ArrayPoolOwners;
 
 namespace ServiceWire.DuplexPipes
 {
-	public class DuplexPipe : IDisposable
+    public class DuplexPipe : IDisposable, IDuplexPipe
+    {
+        private readonly Stream _stream;
+		private Pipe _readPipe;
+        private Pipe _writePipe;
+        private Task _execute;
+
+        private ReadOnlySequence<byte> cachedSequence = ReadOnlySequence<byte>.Empty;
+
+        public DuplexPipe(Stream stream)
+        {
+            this._stream = stream;
+		}
+
+        public PipeReader Input => _readPipe.Reader;
+
+        public PipeWriter Output => _writePipe.Writer;
+
+		public void Start()
+        {
+            PipeOptions receivePipeOptions = PipeOptions.Default;
+            PipeOptions sendPipeOptions = PipeOptions.Default;
+            _readPipe = new Pipe(receivePipeOptions);
+            _writePipe = new Pipe(sendPipeOptions);
+
+            _execute = ExecuteAsync();
+        }
+
+       public ReadOnlyMemory<byte> ReadAsync()
+        {
+            async Task<ReadResult> Read()
+            {
+                if (!Input.TryRead(out var readResultInternal))
+                {
+                    var readResultTask = Input.ReadAsync();
+                    readResultInternal = readResultTask.IsCompleted ? readResultTask.Result : await readResultTask;
+                }
+                return readResultInternal;
+            }
+
+            while (true)
+            {
+                var result = Read().GetAwaiter().GetResult();
+
+                var buffer = result.Buffer;
+                SequenceMarshal.TryGetReadOnlyMemory(buffer, out ReadOnlyMemory<byte> memory);
+                Input.AdvanceTo(buffer.End);
+
+                return memory;
+            }
+        }
+
+        public ReadOnlyMemory<byte> ReadAsync(int count)
+		{
+            async Task<ReadResult> Read()
+            {
+                ReadResult readResult;
+
+                if (!Input.TryRead(out readResult))
+                {
+                    var readResultTask = Input.ReadAsync();
+                    readResult = readResultTask.IsCompleted ? readResultTask.Result : await readResultTask;
+                }
+                
+                return readResult;
+		    }
+
+			while (cachedSequence.Length < count)
+            {
+                var result = Read().GetAwaiter().GetResult();
+
+                if (result.Buffer.Length >= 0)
+                {
+                    var builder = new SequenceBuilder<byte>();
+                    builder.Append(cachedSequence);
+                    builder.Append(result.Buffer);
+                    var buffer = builder.Build();
+                    cachedSequence = buffer;
+
+                    Input.AdvanceTo(result.Buffer.End);
+                }
+                else
+                {
+                    Input.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                }
+            }
+            var position = cachedSequence.GetPosition(count);
+            var chank = cachedSequence.Slice(0, position);
+            
+            cachedSequence = cachedSequence.Slice(position);
+            return chank.ToArray();
+
+        }
+
+        public ValueTask AppendToBuffer(ReadOnlyMemory<byte> memory)
+        {
+            var builder = new SequenceBuilder<byte>();
+            builder.Append(cachedSequence);
+            builder.Append(new Segment<byte>(memory));
+            cachedSequence = builder.Build();
+
+            return default;
+        }
+
+		public ValueTask Write(in ReadOnlyMemory<byte> payload)
+        {
+            return Write(payload.Span);
+        }
+
+        public ValueTask Write(in ReadOnlySpan<byte> payload)
+        {
+            async ValueTask AwaitFlushAndRelease()
+            {
+                var flushTask = _writePipe.Writer.Flush();
+                if (!flushTask.IsCompleted)
+                {
+                    await flushTask;
+                }
+            }
+
+            _writePipe.Writer.Write(payload);
+            return AwaitFlushAndRelease();
+        }
+
+		private async Task ExecuteAsync()
+        {
+            Exception exception = null;
+            try
+            {
+                var receiveTask = Receive();
+                var sendTask = Send();
+                if (await Task.WhenAny(receiveTask, sendTask) == sendTask)
+                {
+                    _stream.Close();
+                    await receiveTask;
+                }
+
+                exception = await sendTask;
+
+                _stream.Dispose();
+            }
+            catch (Exception e)
+            {
+                exception = e;
+            }
+			finally
+            {
+                Output.Complete(exception);
+            }
+        }
+
+        private async Task Receive()
+        {
+            Exception exception = null;
+            var writer = _readPipe.Writer;
+            try
+            {
+                while (true)
+                {
+                    int read;
+                    using (var memoryOwner = ArrayPoolOwner<byte>.Rent(256))
+                    {
+                        read = await _stream.ReadAsync(memoryOwner.Array, 0, memoryOwner.Array.Length).ConfigureAwait(false);
+                        await writer.WriteAsync(new ReadOnlyMemory<byte>(memoryOwner.Array, 0, read)).ConfigureAwait(false);
+                    }
+
+                    if (read == 0)
+                        break;
+
+                    var flush = await writer.FlushAsync().ConfigureAwait(false);
+                    if (flush.IsCanceled || flush.IsCompleted) break;
+                }
+
+            }
+            catch (Exception e)
+            {
+                exception = e;
+            }
+
+            writer.Complete(exception);
+        }
+
+        private async Task<Exception> Send()
+        {
+            Exception exception = null;
+            var reader = _writePipe.Reader;
+            try
+            {
+                while (true)
+                {
+					var result = await reader.ReadAsync();
+                    if (!result.IsCompleted)
+                    {
+                        await _stream.FlushAsync().ConfigureAwait(false);
+                    }
+                    if (result.IsCanceled) break;
+
+                    var isCompleted = result.IsCompleted;
+
+					var buffer = result.Buffer;
+                    if (!buffer.IsEmpty)
+                    {
+                        await WriteBuffer(_stream, buffer);
+                    }
+
+                    reader.AdvanceTo(buffer.End);
+                    if (isCompleted) break;
+                }
+            }
+            catch (Exception e)
+            {
+                exception = e;
+            }
+
+            return exception;
+        }
+
+        private static Task WriteBuffer(Stream target, in ReadOnlySequence<byte> data)
+        {
+            async ValueTask WriteBufferAwaited(Stream ttarget, ReadOnlySequence<byte> ddata)
+            {
+                foreach (var segment in ddata)
+                {
+                    await ttarget.WriteAsync(segment);
+                }
+            }
+
+            var writeTask = data.IsSingleSegment ? target.WriteAsync(data.First) : WriteBufferAwaited(target, data);
+
+            return writeTask.IsCompletedSuccessfully ? Task.CompletedTask : writeTask.AsTask();
+
+        }
+
+		public void Stop()
+        {
+            Output.Complete();
+		}
+        public void Dispose()
+        {
+            Output.Complete();
+            _execute.GetAwaiter().GetResult();
+        }
+    }
+
+    internal static class Extension
 	{
-		private readonly Stream _stream;
-		private readonly Pipe _readPipe;
-		private readonly Pipe _writePipe;
+		internal static Task PipelinesFireAndForget(this Task task)
+        {
+            return task?.ContinueWith(t => GC.KeepAlive(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
+        }
 
-		private volatile bool _receiveAborted;
-		private volatile bool _isSendComplite;
-
-		private ReadOnlySequence<byte> cachedData = ReadOnlySequence<byte>.Empty;
-
-		public DuplexPipe(NetworkStream stream)
-		{
-			_stream = stream;
-			PipeOptions receivePipeOptions = PipeOptions.Default;
-			_readPipe = new Pipe(receivePipeOptions);
-			receivePipeOptions.ReaderScheduler.Schedule(
-				obj => ((DuplexPipe)obj).CopyFromStreamToPipe().PipelinesFireAndForget(), this);
-
-			PipeOptions sendPipeOptions = PipeOptions.Default;
-			_writePipe = new Pipe(sendPipeOptions);
-			sendPipeOptions.WriterScheduler.Schedule(
-				obj => ((DuplexPipe)obj).CopyFromWritePipeToStream().PipelinesFireAndForget(), this);
-		}
-
-		public PipeReader Input => _readPipe.Reader;
-
-		public PipeWriter Output => _writePipe.Writer;
-
-		public ReadOnlyMemory<byte> ReadBytesAsync(int count)
-		{
-			async ValueTask<ReadResult> Read()
-			{
-				if (!Input.TryRead(out var readResultInternal))
-				{
-					var readResultTask = Input.ReadAsync();
-					readResultInternal = readResultTask.IsCompleted ? readResultTask.Result : await readResultTask;
-				}
-				return readResultInternal;
-			}
-
-			if (cachedData.Length < count)
-			{
-				ReadResult readResult = Read().Result;
-				cachedData = readResult.Buffer;
-				Input.AdvanceTo(cachedData.End);
-			}
-
-			ReadOnlyMemory<byte> memory;
-			if (cachedData.First.Length >= count)
-			{
-				memory = cachedData.First.Slice(0, count);
-			}
-			else
-			{
-				ReadOnlySequence<byte> sequence = cachedData.Slice(0, count);
-				SequenceMarshal.TryGetReadOnlyMemory(sequence, out memory);
-			}
-
-			cachedData = cachedData.Slice(count);
-			return memory;
-		}
-
-		public void Dispose()
-		{
-			const int connectTimeoutMs = 100;
-			_receiveAborted = true;
-			_writePipe.Writer.Complete();
-			while (!_isSendComplite)
-			{
-				if (!SpinWait.SpinUntil(() => _isSendComplite, connectTimeoutMs))
-				{
-					throw new TimeoutException("Unable to connect within " + connectTimeoutMs + "ms");
-				}
-			}
-			_stream.Dispose();
-		}
-
-		public ValueTask WriteAsync(ReadOnlyMemory<byte> payload)
-		{
-			async ValueTask AwaitFlushAndRelease(ValueTask<FlushResult> flush)
-			{
-				await flush;
-			}
-
-			var write = _writePipe.Writer.WriteAsync(payload);
-			if (write.IsCompletedSuccessfully) return default;
-			return AwaitFlushAndRelease(write);
-		}
-
-		private async Task CopyFromStreamToPipe()
-		{
-			Exception ex = null;
-			var writer = _readPipe.Writer;
-			try
-			{
-				while (true)
-				{
-
-#if NET462 || NETCOREAPP2_0
-					const int bufferSize = 4096;
-					var buffer = new byte[bufferSize];
-					int read = await _stream.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false);
-					await writer.WriteAsync(new ReadOnlyMemory<byte>(buffer, 0, read)).ConfigureAwait(false);
-#else
-					var memory = writer.GetMemory(1);
-					int read = await _stream.ReadAsync(memory).ConfigureAwait(false);
-					writer.Advance(read);
-#endif
-
-					if (read <= 0)
-						break;
-					var flush = await writer.FlushAsync().ConfigureAwait(false);
-					if (flush.IsCanceled || flush.IsCompleted) break;
-				}
-			}
-			catch (Exception e)
-			{
-				if (!_receiveAborted)
-					ex = e;
-			}
-			writer.Complete(ex);
-		}
-
-		private async Task CopyFromWritePipeToStream()
-		{
-			Exception error = null;
-			var reader = _writePipe.Reader;
-			try
-			{
-				while (true)
-				{
-					var pending = reader.ReadAsync();
-					if (!pending.IsCompleted)
-					{
-						await _stream.FlushAsync().ConfigureAwait(false);
-					}
-
-					var result = await pending;
-					ReadOnlySequence<byte> buffer;
-					do
-					{
-						buffer = result.Buffer;
-						if (!buffer.IsEmpty)
-						{
-							await WriteBuffer(_stream, buffer).ConfigureAwait(false);
-						}
-
-						reader.AdvanceTo(buffer.End);
-					} while (!(buffer.IsEmpty && result.IsCompleted)
-					         && reader.TryRead(out result));
-
-					if (result.IsCanceled) break;
-					if (buffer.IsEmpty && result.IsCompleted)
-						break;
-				}
-			}
-			catch (Exception ex)
-			{
-				if (!_receiveAborted)
-					error = ex;
-			}
-
-			_isSendComplite = true;
-			reader.Complete(error);
-		}
-
-		private static Task WriteBuffer(Stream target, in ReadOnlySequence<byte> data)
-		{
-			async Task WriteBufferAwaited(Stream ttarget, ReadOnlySequence<byte> ddata)
-			{
-				foreach (var segment in ddata)
-				{
-					await ttarget.WriteAsync(segment);
-				}
-			}
-
-			if (data.IsSingleSegment)
-			{
-				var vt = target.WriteAsync(data.First);
-				return vt.IsCompletedSuccessfully ? Task.CompletedTask : vt.AsTask();
-			}
-
-			return WriteBufferAwaited(target, data);
-		}
-	}
-
-#if NET462 || NETCOREAPP2_0
-	internal static class Extension
-	{
-		public static ValueTask WriteAsync(this Stream stream, ReadOnlyMemory<byte> buffer)
-		{
-			using (ICustomMemoryOwner<byte> memoryOwner = buffer.Lease())
-			{
-				return new ValueTask(stream.WriteAsync(memoryOwner.Array, 0, buffer.Length));
-			}
-		}
-	}
-#endif
-
-
-	internal static class Ext
-	{
-		internal static void PipelinesFireAndForget(this Task task)
-			=> task?.ContinueWith(t => GC.KeepAlive(t.Exception), TaskContinuationOptions.OnlyOnFaulted);
-
-		internal static ValueTask<bool> Flush(this PipeWriter writer)
+        internal static ValueTask<bool> Flush(this PipeWriter writer)
 		{
 			bool GetResult(FlushResult flush)
 				=> !(flush.IsCanceled || flush.IsCompleted);
@@ -230,5 +275,72 @@ namespace ServiceWire.DuplexPipes
 				? new ValueTask<bool>(GetResult(flushTask.Result))
 				: Awaited(flushTask);
 		}
+
+#if NET462 || NETCOREAPP2_0
+		public static ValueTask WriteAsync(this Stream stream, ReadOnlyMemory<byte> buffer)
+		{
+			using (ICustomMemoryOwner<byte> memoryOwner = buffer.Lease())
+			{
+				return new ValueTask(stream.WriteAsync(memoryOwner.Array, 0, buffer.Length));
+			}
+		}
+#endif
 	}
+
+    public class SequenceBuilder<T>
+    {
+        private Segment<T> _head;
+        private Segment<T> _tail;
+
+        public void Append(Segment<T> segment)
+        {
+            if (segment.Memory.Length == 0)
+                return;
+
+            if (_head == null)
+            {
+                segment.SetIndex(0);
+                _head = _tail = segment;
+            }
+            else
+            {
+
+                Segment<T> newTail = segment;
+                Segment<T> oldTail = _tail;
+                oldTail.SetNext(newTail);
+                newTail.SetIndex(oldTail.RunningIndex + oldTail.Memory.Length);
+                _tail = newTail;
+            }
+        }
+
+        public void Append(in ReadOnlySequence<T> sequence)
+        {
+            foreach (var readOnlyMemory in sequence)
+            {
+                Append(new Segment<T>(readOnlyMemory));
+            }
+        }
+
+        public ReadOnlySequence<T> Build()
+        {
+            Segment<T> head = _head;
+            Segment<T> tail = _tail;
+            _head = _tail = null;
+
+            if (head == null)
+                return ReadOnlySequence<T>.Empty;
+            return new ReadOnlySequence<T>(head, 0, tail, tail.Memory.Length);
+        }
+    }
+
+    public sealed class Segment<T> : ReadOnlySequenceSegment<T>
+    {
+        public Segment(in ReadOnlyMemory<T> memory)
+        {
+            Memory = memory;
+        }
+
+        public void SetIndex(long value) => RunningIndex = value;
+        public void SetNext(ReadOnlySequenceSegment<T> value) => Next = value;
+    }
 }

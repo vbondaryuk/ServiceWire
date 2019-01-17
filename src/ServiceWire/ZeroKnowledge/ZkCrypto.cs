@@ -44,9 +44,9 @@ namespace ServiceWire.ZeroKnowledge
                 crypto.BlockSize = 128;
                 crypto.KeySize = 256;
                 crypto.Padding = PaddingMode.ISO10126;
-                using (var dencryptor = crypto.CreateDecryptor(_key, _iv))
+                using (var decryptor = crypto.CreateDecryptor(_key, _iv))
                 {
-                    return dencryptor.TransformFinalBlock(encrypted, 0, encrypted.Length);
+                    return decryptor.TransformFinalBlock(encrypted, 0, encrypted.Length);
                 }
             }
         }

@@ -8,6 +8,7 @@ using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
 
 namespace DemoHost
 {
@@ -15,10 +16,10 @@ namespace DemoHost
     {
         static void Main(string[] args)
         {
-            var logger = new Logger(logLevel: LogLevel.Debug, options: LogOptions.LogOnlyToConsole);
+            var logger = new Logger(logLevel: LogLevel.Debug, options: LogOptions.LogOnlyToConsole, messageBufferSize:1);
             var stats = new Stats();
-			 
-            var addr = new[] { "127.0.0.1", "8098" }; //defaults
+
+            var addr = new[] { "127.0.0.1", "8099" }; //defaults
             if (null != args && args.Length > 0)
             {
                 var parts = args[0].Split(':');
@@ -46,13 +47,28 @@ namespace DemoHost
 
 			var test = new Test();
 			tcphost.AddService<ITest>(test);
-
+            tcphost.IsPipeline = false;
             tcphost.Open();
+
+            var tcphostPipeline = new TcpHost(new IPEndPoint(IPAddress.Any, 8088), logger, stats, zkRepository)
+            {
+                UseCompression = useCompression,
+                CompressionThreshold = compressionThreshold
+            };
+
+            tcphostPipeline.AddService<IDataContract>(new DataContractImpl());
+
+            tcphostPipeline.AddService<IComplexDataContract>(new ComplexDataContractImpl());
+
+            tcphostPipeline.AddService<ITest>(new Test());
+            tcphostPipeline.IsPipeline = true;
+            tcphostPipeline.Open();
+
 
             Console.WriteLine("Press Enter to stop the dual host test.");
             Console.ReadLine();
 
-            tcphost.Close();
+            tcphostPipeline.Close();
 
             Console.WriteLine("Press Enter to quit.");
             Console.ReadLine();
@@ -66,7 +82,19 @@ namespace DemoHost
 			return Task.CompletedTask;
 		}
 
-	    public Task<int> GetAsync()
+        Task<string[]> ITest.GetAsync()
+        {
+            var list = Enumerable.Range(0, 50).Select(x => Guid.NewGuid().ToString("D")).ToArray();
+            return Task.FromResult(list);
+        }
+
+        public string[] GetItems(Guid id)
+        {
+            var list = Enumerable.Range(0, 50).Select(x => Guid.NewGuid().ToString("D")).ToArray();
+            return list;
+        }
+
+        public Task<int> GetAsync()
 	    {
 			return Task.FromResult(1);
 		}

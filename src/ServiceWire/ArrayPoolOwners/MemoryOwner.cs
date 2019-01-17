@@ -8,7 +8,7 @@ namespace ServiceWire.ArrayPoolOwners
 		public static ICustomMemoryOwner<T> Lease<T>(
 			this ReadOnlySequence<T> source)
 		{
-			if (source.IsEmpty) return SimpleMemoryOwner<T>.Empty;
+			if (source.IsEmpty) return EmptyMemoryOwner<T>.Empty;
 
 			int len = checked((int)source.Length);
 			var arr = ArrayPool<T>.Shared.Rent(len);
@@ -19,7 +19,7 @@ namespace ServiceWire.ArrayPoolOwners
 		public static ICustomMemoryOwner<T> Lease<T>(
 			this ReadOnlyMemory<T> source)
 		{
-			if (source.IsEmpty) return SimpleMemoryOwner<T>.Empty;
+			if (source.IsEmpty) return EmptyMemoryOwner<T>.Empty;
 
 			T[] array = ArrayPool<T>.Shared.Rent(source.Length);
 			source.CopyTo(array);
@@ -32,7 +32,7 @@ namespace ServiceWire.ArrayPoolOwners
 			if (source == null) return null;
 			if (length < 0) length = source.Length;
 			else if (length > source.Length) throw new ArgumentOutOfRangeException(nameof(length));
-			return length == 0 ? SimpleMemoryOwner<T>.Empty : new ArrayPoolOwner<T>(source, length);
+			return length == 0 ? EmptyMemoryOwner<T>.Empty : new ArrayPoolOwner<T>(source, length);
 		}
 	}
 }

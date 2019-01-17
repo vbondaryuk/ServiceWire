@@ -4,7 +4,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
 using System.IO;
+using System.Net.Sockets;
 using System.Threading.Tasks;
+using ServiceWire.ArrayPoolOwners;
+using ServiceWire.DuplexPipes;
 using ServiceWire.ZeroKnowledge;
 
 namespace ServiceWire
@@ -17,63 +20,45 @@ namespace ServiceWire
         protected int _compressionThreshold = 131072; //128KB
         protected ILog _log = new NullLogger();
         protected IStats _stats = new NullStats();
+        protected ISerializer _serializer;
         protected IZkRepository _zkRepository = new ZkNullRepository();
         private volatile bool _requireZk = false;
 
-        protected ConcurrentDictionary<string, int> _serviceKeys = new ConcurrentDictionary<string, int>(); 
+        protected ConcurrentDictionary<string, int> _serviceKeys = new ConcurrentDictionary<string, int>();
         protected ConcurrentDictionary<int, ServiceInstance> _services = new ConcurrentDictionary<int, ServiceInstance>();
-        protected ParameterTransferHelper _parameterTransferHelper = new ParameterTransferHelper();
+        protected readonly ParameterTransferHelper _parameterTransferHelper;
+
+        public Host()
+        {
+            _parameterTransferHelper = new ParameterTransferHelper(_serializer);
+        }
 
         public IZkRepository ZkRepository
         {
-            get
-            {
-                return _zkRepository;
-            }
+            get => _zkRepository;
             set
             {
                 _zkRepository = value;
-                if (_zkRepository is ZkNullRepository) 
-                    _requireZk = false;
-                else 
-                    _requireZk = true;
+                _requireZk = !(_zkRepository is ZkNullRepository);
             }
         }
 
         public IStats Stats
         {
-            get
-            {
-                return _stats;
-            }
-            set
-            {
-                _stats = value ?? _stats;
-            }
+            get => _stats;
+            set => _stats = value ?? _stats;
         }
 
         public ILog Log
         {
-            get
-            {
-                return _log;
-            }
-            set
-            {
-                _log = value ?? _log;
-            }
+            get => _log;
+            set => _log = value ?? _log;
         }
 
         protected bool Continue
         {
-            get
-            {
-                return _continueListening;
-            }
-            set
-            {
-                _continueListening = value;
-            }
+            get => _continueListening;
+            set => _continueListening = value;
         }
 
         /// <summary>
@@ -83,14 +68,8 @@ namespace ServiceWire
         /// </summary>
         public bool UseCompression
         {
-            get
-            {
-                return _useCompression;
-            }
-            set
-            {
-                _useCompression = value;
-            }
+            get => _useCompression;
+            set => _useCompression = value;
         }
 
         /// <summary>
@@ -100,10 +79,7 @@ namespace ServiceWire
         /// </summary>
         public int CompressionThreshold
         {
-            get
-            {
-                return _compressionThreshold;
-            }
+            get => _compressionThreshold;
             set
             {
                 _compressionThreshold = value;
@@ -138,14 +114,13 @@ namespace ServiceWire
             }
         }
 
-
         /// <summary>
         /// Loads all methods from interfaces and assigns an identifier
         /// to each. These are later synchronized with the client.
         /// </summary>
         private ServiceInstance CreateMethodMap(int keyIndex, Type serviceType, object service)
         {
-            var instance = new ServiceInstance()
+            var instance = new ServiceInstance
             {
                 KeyIndex = keyIndex,
                 InterfaceType = serviceType,
@@ -192,14 +167,14 @@ namespace ServiceWire
             foreach (var kvp in instance.InterfaceMethods)
             {
                 var parameters = kvp.Value.GetParameters();
-                var parameterTypes = new Type[parameters.Length];
+                var parameterTypes = new string[parameters.Length];
                 for (var i = 0; i < parameters.Length; i++)
-                    parameterTypes[i] = parameters[i].ParameterType;
+                    parameterTypes[i] = parameters[i].ParameterType.FullName;
                 syncSyncInfos.Add(new MethodSyncInfo
                 {
-                    MethodIdent = kvp.Key, 
-                    MethodName = kvp.Value.Name, 
-                    MethodReturnType = kvp.Value.ReturnType, 
+                    MethodIdent = kvp.Key,
+                    MethodName = kvp.Value.Name,
+                    MethodReturnType = kvp.Value.ReturnType.FullName,
                     ParameterTypes = parameterTypes
                 });
             }
@@ -245,6 +220,8 @@ namespace ServiceWire
             ProcessRequest(stream, stream);
         }
 
+        public bool IsPipeline;
+
         /// <summary>
         /// This method handles all requests from a single client.
         /// There is one thread running this method for each connected client.
@@ -255,8 +232,20 @@ namespace ServiceWire
         {
             if (null == readStream || null == writeStream) return;
 
-            var binReader = new BinaryReader(readStream);
-            var binWriter = new BinaryWriter(writeStream);
+            BinaryReader binReader = null;
+            BinaryWriter binWriter = null;
+            DuplexPipe duplexPipe = null;
+			if (IsPipeline)
+            {
+                duplexPipe = new DuplexPipe((NetworkStream)readStream);
+                duplexPipe.Start();
+            }
+            else
+            {
+                binReader = new BinaryReader(readStream);
+                binWriter = new BinaryWriter(writeStream);
+			}
+
             bool doContinue = true;
             try
             {
@@ -267,26 +256,34 @@ namespace ServiceWire
                     try
                     {
                         //read message type
-                        var messageType = (MessageType)binReader.ReadInt32();
+                        var messageType = IsPipeline? (MessageType)duplexPipe.ReadInt() : (MessageType)binReader.ReadInt32();
                         switch (messageType)
                         {
                             case MessageType.ZkInitiate:
                                 zkSession = new ZkSession(_zkRepository, _log, _stats);
-                                doContinue = zkSession.ProcessZkInitiation(binReader, binWriter, sw);
+                                doContinue = IsPipeline ? zkSession.ProcessZkInitiation(duplexPipe, sw) : zkSession.ProcessZkInitiation(binReader, binWriter, sw);
                                 break;
                             case MessageType.ZkProof:
                                 if (null == zkSession) throw new NullReferenceException("session null");
-                                doContinue = zkSession.ProcessZkProof(binReader, binWriter, sw);
-                                break;
+                                doContinue = IsPipeline ? zkSession.ProcessZkProof(duplexPipe, sw) : zkSession.ProcessZkProof(binReader, binWriter, sw);
+								break;
                             case MessageType.SyncInterface:
-                                ProcessSync(zkSession, binReader, binWriter, sw);
+                                if (IsPipeline)
+                                    ProcessSync(zkSession, duplexPipe, sw);
+                                else
+                                    ProcessSync(zkSession, binReader, binWriter, sw);
                                 break;
                             case MessageType.MethodInvocation:
-                                ProcessInvocation(zkSession, binReader, binWriter, sw);
-                                break;
+                                if (IsPipeline)
+									ProcessInvocation(zkSession, duplexPipe, sw);
+								else
+									ProcessInvocation(zkSession, binReader, binWriter, sw);
+
+								break;
                             case MessageType.TerminateConnection:
                                 doContinue = false;
-                                break;
+                                _log.Info("Terminated");
+								break;
                             default:
                                 doContinue = false;
                                 break;
@@ -306,12 +303,12 @@ namespace ServiceWire
                 _log.Fatal("Fatal error in ProcessRequest: {0}", fatalException.ToString().Flatten());
             }
             finally
-            {
-                binReader.Close();
-                binWriter.Close();
-            }
+			{
+				duplexPipe?.Stop();
+				binReader?.Close();
+                binWriter?.Close();
+			}
         }
-
 
         private void ProcessSync(ZkSession session, BinaryReader binReader, BinaryWriter binWriter, Stopwatch sw)
         {
@@ -324,7 +321,7 @@ namespace ServiceWire
                 var len = binReader.ReadInt32();
                 var bytes = binReader.ReadBytes(len);
                 var data = session.Crypto.Decrypt(bytes);
-                serviceTypeName = data.ConverToString();
+                serviceTypeName = data.ConvertToString();
             }
             else
             {
@@ -339,7 +336,7 @@ namespace ServiceWire
                 {
                     syncCat = instance.InterfaceType.Name;
                     //Create a list of sync infos from the dictionary
-                    var syncBytes = instance.ServiceSyncInfo.ToSerializedBytes();
+                    var syncBytes = _serializer.Serialize(instance.ServiceSyncInfo);
                     if (_requireZk)
                     {
                         _log.Debug("Unencrypted data sent to server: {0}", Convert.ToBase64String(syncBytes));
@@ -361,6 +358,57 @@ namespace ServiceWire
                 binWriter.Write(0);
             }
             binWriter.Flush();
+            _log.Debug("SyncInterface for {0} in {1}ms.", syncCat, sw.ElapsedMilliseconds);
+        }
+
+        private void ProcessSync(ZkSession session, DuplexPipe duplexPipe, Stopwatch sw)
+        {
+            var syncCat = "Sync";
+
+            string serviceTypeName;
+            if (_requireZk)
+            {
+                //use session and encryption - if throws should not have gotten this far
+                var len = duplexPipe.ReadInt();
+                var bytes = duplexPipe.Read(len);
+                var data = session.Crypto.Decrypt(bytes);
+                serviceTypeName = data.ConvertToString();
+            }
+            else
+            {
+                serviceTypeName = duplexPipe.ReadString();
+            }
+
+            int serviceKey;
+            if (_serviceKeys.TryGetValue(serviceTypeName, out serviceKey))
+            {
+                ServiceInstance instance;
+                if (_services.TryGetValue(serviceKey, out instance))
+                {
+                    syncCat = instance.InterfaceType.Name;
+                    //Create a list of sync infos from the dictionary
+                    var syncBytes = _serializer.Serialize(instance.ServiceSyncInfo);
+                    if (_requireZk)
+                    {
+                        _log.Debug("Unencrypted data sent to server: {0}", Convert.ToBase64String(syncBytes));
+                        var encData = session.Crypto.Encrypt(syncBytes);
+                        duplexPipe.Write(encData.Length);
+                        duplexPipe.Write((ReadOnlySpan<byte>) encData);
+                        _log.Debug("Encrypted data sent server: {0}", Convert.ToBase64String(encData));
+                    }
+                    else
+                    {
+                        duplexPipe.Write(syncBytes.Length);
+                        duplexPipe.Write((ReadOnlySpan<byte>) syncBytes);
+                    }
+                }
+            }
+            else
+            {
+                //return zero to indicate type or version of type not found
+                duplexPipe.Write(0);
+            }
+
             _log.Debug("SyncInterface for {0} in {1}ms.", syncCat, sw.ElapsedMilliseconds);
         }
 
@@ -474,9 +522,108 @@ namespace ServiceWire
             _stats.Log(cat, stat, sw.ElapsedMilliseconds);
         }
 
-        #region IDisposable Members
+        private void ProcessInvocation(ZkSession session, IDuplexPipe duplexPipe, Stopwatch sw)
+		{
+			//read service instance key
+			var cat = "unknown";
+			var stat = "MethodInvocation";
+			int invokedServiceKey = duplexPipe.ReadInt();
+			ServiceInstance invokedInstance;
+			if (_services.TryGetValue(invokedServiceKey, out invokedInstance))
+			{
+				cat = invokedInstance.InterfaceType.Name;
+				//read the method identifier
+				int methodHashCode = duplexPipe.ReadInt();
+				if (invokedInstance.InterfaceMethods.ContainsKey(methodHashCode))
+				{
+					MethodInfo method;
+					invokedInstance.InterfaceMethods.TryGetValue(methodHashCode, out method);
+					stat = method.Name;
 
-        private bool _disposed = false;
+					bool[] isByRef;
+					invokedInstance.MethodParametersByRef.TryGetValue(methodHashCode, out isByRef);
+
+					//read parameter data
+                    if (_requireZk)
+					{
+						var len = duplexPipe.ReadInt();
+						var encData = duplexPipe.Read(len);
+
+                        var encrypted = session.Crypto.Decrypt(encData);
+                        _ = duplexPipe.AppendToBuffer(encrypted);
+					}
+
+                    var parameters = _parameterTransferHelper.ReceiveParameters(duplexPipe);
+
+                    //invoke the method
+                    object[] returnParameters;
+					var returnMessageType = MessageType.ReturnValues;
+					try
+					{
+						object returnValue = method.Invoke(invokedInstance.SingletonInstance, parameters);
+						if (returnValue is Task task)
+						{
+							task.GetAwaiter().GetResult();
+							var prop = task.GetType().GetProperty("Result");
+							returnValue = prop?.GetValue(task);
+						}
+						//the result to the client is the return value (null if void) and the input parameters
+						returnParameters = new object[1 + parameters.Length];
+						returnParameters[0] = returnValue;
+						for (int i = 0; i < parameters.Length; i++)
+							returnParameters[i + 1] = isByRef[i] ? parameters[i] : null;
+					}
+					catch (Exception ex)
+					{
+						//an exception was caught. Rethrow it client side
+						returnParameters = new object[] { ex };
+						returnMessageType = MessageType.ThrowException;
+					}
+
+					//send the result back to the client
+					// (1) write the message type
+					duplexPipe.Write((int)returnMessageType);
+
+					// (2) write the return parameters
+					if (_requireZk)
+					{
+                        using (IDuplexPipe simplePipe = new FakeDuplexPipe())
+                        {
+                            _parameterTransferHelper.SendParameters(
+                                invokedInstance.ServiceSyncInfo.UseCompression,
+                                invokedInstance.ServiceSyncInfo.CompressionThreshold,
+                                simplePipe,
+                                returnParameters);
+                            byte[] data = simplePipe.ReadAsync().ToArray();
+                            _log.Debug("Unencrypted data sent server: {0}", Convert.ToBase64String(data));
+                            var encData = session.Crypto.Encrypt(data);
+                            _log.Debug("Encrypted data sent server: {0}", Convert.ToBase64String(encData));
+                            duplexPipe.Write(encData.Length);
+                            duplexPipe.Write((ReadOnlySpan<byte>) encData);
+                        }
+
+					}
+					else
+					{
+						_parameterTransferHelper.SendParameters(
+							invokedInstance.ServiceSyncInfo.UseCompression,
+							invokedInstance.ServiceSyncInfo.CompressionThreshold,
+							duplexPipe,
+							returnParameters);
+					}
+				}
+				else
+					duplexPipe.Write((int)MessageType.UnknownMethod);
+			}
+			else
+				duplexPipe.Write((int)MessageType.UnknownMethod);
+
+			_stats.Log(cat, stat, sw.ElapsedMilliseconds);
+		}
+
+		#region IDisposable Members
+
+		private bool _disposed = false;
 
         public void Dispose()
         {

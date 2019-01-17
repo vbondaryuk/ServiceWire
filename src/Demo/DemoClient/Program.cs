@@ -27,7 +27,7 @@ namespace DemoClient
 
             var ip = addr[0];
             var port = Convert.ToInt32(addr[1]);
-            var zkEndpoint = new TcpZkEndPoint("username", "password", 
+            var zkEndpoint = new TcpZkEndPoint("username", "password",
                 new IPEndPoint(IPAddress.Parse(ip), port), connectTimeOutMs: 2500);
 
             Console.WriteLine("Iteration 1");
@@ -46,7 +46,6 @@ namespace DemoClient
 			{
 				client.InjectLoggerStats(logger, stats);
 				await client.Proxy.SetAsync(1);
-				int value = await client.Proxy.GetAsync();
 			}
 
 			using (var client = new TcpClient<IDataContract>(zkEndpoint))

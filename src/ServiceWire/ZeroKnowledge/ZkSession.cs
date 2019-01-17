@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using ServiceWire.DuplexPipes;
 
 namespace ServiceWire.ZeroKnowledge
 {
@@ -50,7 +51,7 @@ namespace ServiceWire.ZeroKnowledge
             binWriter.Write(_serverSessionHash);
             _logger.Debug("ZkProof session hash sent to client: {0}", Convert.ToBase64String(_serverSessionHash));
             return true;
-        }
+		}
 
         public bool ProcessZkInitiation(BinaryReader binReader, BinaryWriter binWriter, Stopwatch sw)
         {
@@ -68,7 +69,7 @@ namespace ServiceWire.ZeroKnowledge
             _bRand = _zkProtocol.CryptRand();
             _bEphemeral = _zkProtocol.GetServerEphemeralB(_zkPasswordHash.Salt, _zkPasswordHash.Verifier, _bRand);
             _scramble = _zkProtocol.CalculateRandomScramble(_aEphemeral, _bEphemeral);
-            _serverSessionKey = _zkProtocol.ServerComputeSessionKey(_zkPasswordHash.Salt, 
+            _serverSessionKey = _zkProtocol.ServerComputeSessionKey(_zkPasswordHash.Salt,
                 _zkPasswordHash.Key, _aEphemeral, _bEphemeral, _scramble);
 
             binWriter.Write(true);
@@ -78,5 +79,52 @@ namespace ServiceWire.ZeroKnowledge
             _logger.Debug("ZkInitiation server Ephemeral sent to client: {0}", Convert.ToBase64String(_bEphemeral));
             return true;
         }
-    }
+
+		public bool ProcessZkProof(DuplexPipe duplexPipe, Stopwatch sw)
+        {
+            _clientSessionHash = duplexPipe.Read(32);
+            _logger.Debug("ZkProof client session hash received: {0}", Convert.ToBase64String(_clientSessionHash));
+            var serverClientSessionHash = _zkProtocol.ClientCreateSessionHash(_username, _zkPasswordHash.Salt,
+                _aEphemeral, _bEphemeral, _serverSessionKey);
+            _serverSessionHash = _zkProtocol.ServerCreateSessionHash(_aEphemeral, _clientSessionHash, _serverSessionKey);
+            if (!_clientSessionHash.IsEqualTo(serverClientSessionHash))
+            {
+                _logger.Debug("ZkProof session hash does not match. Authentication failed. Server session hash: {0}", Convert.ToBase64String(_serverSessionHash));
+                duplexPipe.Write(false);
+                return false;
+            }
+            _zkCrypto = new ZkCrypto(_serverSessionKey, _scramble);
+            duplexPipe.Write(true);
+            duplexPipe.Write((ReadOnlySpan<byte>) _serverSessionHash);
+            _logger.Debug("ZkProof session hash sent to client: {0}", Convert.ToBase64String(_serverSessionHash));
+            return true;
+        }
+
+        public bool ProcessZkInitiation(DuplexPipe duplexPipe, Stopwatch sw)
+        {
+            _username = duplexPipe.ReadString();
+            _aEphemeral = duplexPipe.Read(32);
+            _logger.Debug("ZkInitiation client username received: {0}", _username);
+            _logger.Debug("ZkInitiation client Ephemeral received: {0}", Convert.ToBase64String(_aEphemeral));
+            _zkPasswordHash = _repository.GetPasswordHashSet(_username);
+            if (null == _zkPasswordHash)
+            {
+                _logger.Debug("ZkInitiation client username not found. Authentication failed.");
+                duplexPipe.Write(false);
+                return false;
+            }
+            _bRand = _zkProtocol.CryptRand();
+            _bEphemeral = _zkProtocol.GetServerEphemeralB(_zkPasswordHash.Salt, _zkPasswordHash.Verifier, _bRand);
+            _scramble = _zkProtocol.CalculateRandomScramble(_aEphemeral, _bEphemeral);
+            _serverSessionKey = _zkProtocol.ServerComputeSessionKey(_zkPasswordHash.Salt,
+                _zkPasswordHash.Key, _aEphemeral, _bEphemeral, _scramble);
+
+            duplexPipe.Write(true);
+            duplexPipe.Write((ReadOnlySpan<byte>) _zkPasswordHash.Salt);
+            _logger.Debug("ZkInitiation hash salt sent to client: {0}", Convert.ToBase64String(_zkPasswordHash.Salt));
+            duplexPipe.Write((ReadOnlySpan<byte>) _bEphemeral);
+            _logger.Debug("ZkInitiation server Ephemeral sent to client: {0}", Convert.ToBase64String(_bEphemeral));
+            return true;
+        }
+	}
 }

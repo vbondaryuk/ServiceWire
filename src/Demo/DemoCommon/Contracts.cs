@@ -7,8 +7,9 @@ namespace DemoCommon
 	public interface ITest
 	{
 		Task SetAsync(int a);
-		Task<int> GetAsync();
-	}
+		Task<string[]> GetAsync();
+        string[] GetItems(Guid id);
+    }
 
     public interface IDataContract
     {

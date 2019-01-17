@@ -6,13 +6,13 @@ namespace ServiceWire.ArrayPoolOwners
 {
 	public sealed class ArrayPoolOwner<T> : ICustomMemoryOwner<T>
 	{
-		private readonly int _length;
+		private int _length;
 		private T[] _oversized;
 
 		internal ArrayPoolOwner(T[] oversized, int length)
 		{
 			_length = length;
-			_oversized = oversized;
+            _oversized = oversized;
 		}
 
 		public static ICustomMemoryOwner<T> Rent(int length)
@@ -20,11 +20,14 @@ namespace ServiceWire.ArrayPoolOwners
 			T[] bytes = ArrayPool<T>.Shared.Rent(length);
 			return new ArrayPoolOwner<T>(bytes, length);
 		}
+
 		public Memory<T> Memory => new Memory<T>(GetArray(), 0, _length);
 
-		public T[] Array => GetArray();
 
-		public T[] GetArray() =>
+        public T[] Array => GetArray();
+
+
+        public T[] GetArray() =>
 			Interlocked.CompareExchange(ref _oversized, null, null)
 			?? throw new ObjectDisposedException(ToString());
 

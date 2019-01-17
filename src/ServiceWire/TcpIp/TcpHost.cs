@@ -22,33 +22,36 @@ namespace ServiceWire.TcpIp
         /// <param name="log"></param>
         /// <param name="stats"></param>
         /// <param name="zkRepository">Only required to support zero knowledge authentication and encryption.</param>
-        public TcpHost(int port, ILog log = null, IStats stats = null, 
-            IZkRepository zkRepository = null)
+        /// <param name="serializer">Inject your own serializer for complex objects and avoid using the Newtonsoft JSON DefaultSerializer.</param>
+        public TcpHost(int port, ILog log = null, IStats stats = null,
+            IZkRepository zkRepository = null, ISerializer serializer = null)
         {
-            Initialize(new IPEndPoint(IPAddress.Any, port), log, stats, zkRepository);
+            Initialize(new IPEndPoint(IPAddress.Any, port), log, stats, zkRepository, serializer);
         }
 
         /// <summary>
         /// Constructs an instance of the host and starts listening for incoming connections on designated endpoint.
         /// All listener threads are regular background threads.
-        /// 
+        ///
         /// NOTE: the instance created from the specified type is not automatically thread safe!
         /// </summary>
         /// <param name="endpoint"></param>
         /// <param name="log"></param>
         /// <param name="stats"></param>
         /// <param name="zkRepository">Only required to support zero knowledge authentication and encryption.</param>
-        public TcpHost(IPEndPoint endpoint, ILog log = null, IStats stats = null, 
-            IZkRepository zkRepository = null)
+        /// <param name="serializer">Inject your own serializer for complex objects and avoid using the Newtonsoft JSON DefaultSerializer.</param>
+        public TcpHost(IPEndPoint endpoint, ILog log = null, IStats stats = null,
+            IZkRepository zkRepository = null, ISerializer serializer = null)
         {
-            Initialize(endpoint, log, stats, zkRepository);
+            Initialize(endpoint, log, stats, zkRepository, serializer);
         }
 
-        private void Initialize(IPEndPoint endpoint, ILog log, IStats stats, IZkRepository zkRepository)
+        private void Initialize(IPEndPoint endpoint, ILog log, IStats stats, IZkRepository zkRepository, ISerializer serializer)
         {
             base.Log = log;
             base.Stats = stats;
             base.ZkRepository = zkRepository ?? new ZkNullRepository();
+            _serializer = serializer ?? new DefaultSerializer();
             _endPoint = endpoint;
             _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             _listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
@@ -60,10 +63,7 @@ namespace ServiceWire.TcpIp
         /// <summary>
         /// Gets the end point this host is listening on
         /// </summary>
-        public IPEndPoint EndPoint
-        {
-            get { return _endPoint; }
-        }
+        public IPEndPoint EndPoint => _endPoint;
 
         protected override void StartListener()
         {
@@ -83,7 +83,7 @@ namespace ServiceWire.TcpIp
                 _listener.Listen(8192);
 
                 _acceptEventArg = new SocketAsyncEventArgs();
-                _acceptEventArg.Completed += new EventHandler<SocketAsyncEventArgs>(acceptEventArg_Completed);
+                _acceptEventArg.Completed += acceptEventArg_Completed;
 
                 while (!_disposed)
                 {
@@ -129,16 +129,23 @@ namespace ServiceWire.TcpIp
                 }
 
                 Socket activeSocket = null;
-                BufferedStream stream = null;
+                Stream stream = null;
                 try
                 {
                     activeSocket = e.AcceptSocket;
 
                     // Signal the listening thread to continue.
                     _listenResetEvent.Set();
-
-                    stream = new BufferedStream(new NetworkStream(activeSocket), 8192);
-                    base.ProcessRequest(stream);
+                    if (IsPipeline)
+                    {
+                        stream = new NetworkStream(activeSocket);
+                        base.ProcessRequest(stream);
+                    }
+                    else
+                    {
+                        stream = new BufferedStream(new NetworkStream(activeSocket), 8192);
+                        base.ProcessRequest(stream);
+					}
                 }
                 catch (Exception ex)
                 {
@@ -146,10 +153,7 @@ namespace ServiceWire.TcpIp
                 }
                 finally
                 {
-                    if (null != stream)
-                    {
-                        stream.Close();
-                    }
+                    stream?.Close();
                     if (null != activeSocket && activeSocket.Connected)
                     {
                         try
