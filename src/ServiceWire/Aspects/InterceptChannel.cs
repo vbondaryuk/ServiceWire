@@ -8,10 +8,10 @@ namespace ServiceWire.Aspects
 {
     public class InterceptChannel : Channel
     {
-        private InterceptPoint _interceptPoint;
+        private readonly InterceptPoint _interceptPoint;
         private ServiceInstance _serviceInstance;
 
-        public InterceptPoint InterceptPoint { get { return _interceptPoint; } }
+        public InterceptPoint InterceptPoint => _interceptPoint;
 
         public InterceptChannel(Type interceptedType, InterceptPoint interceptPoint, ISerializer serializer)
         {
@@ -33,7 +33,7 @@ namespace ServiceWire.Aspects
         /// </summary>
         private void CreateMethodMap()
         {
-            _serviceInstance = new ServiceInstance()
+            _serviceInstance = new ServiceInstance
             {
                 KeyIndex = 0, //only one per intercepted interface
                 InterfaceType = _serviceType,
@@ -104,7 +104,6 @@ namespace ServiceWire.Aspects
         protected override object[] InvokeMethod(string metaData, params object[] parameters)
         {
             object[] returnParameters = null;
-            Type returnType = null;
             try
             {
                 var mdata = metaData.Split('|');
@@ -145,16 +144,13 @@ namespace ServiceWire.Aspects
                     bool[] isByRef;
                     _serviceInstance.MethodParametersByRef.TryGetValue(ident, out isByRef);
 
-                    returnType = (null == method) ? null : method.ReturnType;
+                    var returnType = null == method ? null : method.ReturnType;
 
                     //invoke the method
                     var returnMessageType = MessageType.ReturnValues;
                     try
                     {
-                        if (null != _interceptPoint.Cut && null != _interceptPoint.Cut.PreInvoke)
-                        {
-                            _interceptPoint.Cut.PreInvoke(_interceptPoint.Id, mdata[0], parameters);
-                        }
+                        _interceptPoint.Cut?.PreInvoke?.Invoke(_interceptPoint.Id, mdata[0], parameters);
 
                         object returnValue = method.Invoke(_serviceInstance.SingletonInstance, parameters);
                         //the result to the client is the return value (null if void) and the input parameters
@@ -171,7 +167,7 @@ namespace ServiceWire.Aspects
                             exceptionOfConcern = exceptionOfConcern.InnerException;
                         }
                         bool shouldThrow = true;
-                        if (null != _interceptPoint.Cut && null != _interceptPoint.Cut.ExceptionHandler)
+                        if (_interceptPoint.Cut?.ExceptionHandler != null)
                         {
                             shouldThrow = _interceptPoint.Cut.ExceptionHandler(_interceptPoint.Id, mdata[0], parameters,
                                 exceptionOfConcern);
@@ -188,10 +184,7 @@ namespace ServiceWire.Aspects
                     }
                     finally
                     {
-                        if (null != _interceptPoint.Cut && null != _interceptPoint.Cut.PostInvoke)
-                        {
-                            _interceptPoint.Cut.PostInvoke(_interceptPoint.Id, mdata[0], returnParameters);
-                        }
+                        _interceptPoint.Cut?.PostInvoke?.Invoke(_interceptPoint.Id, mdata[0], returnParameters);
                     }
                     return returnParameters;
                 }
