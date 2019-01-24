@@ -33,7 +33,7 @@ class IDataContract extends Rpc {
     constructor(url){
         super(url);
 
-        this.serviceKey = "DemoCommon.IDataContract";        
+        this.serviceKey = "DemoCommon.IDataContract";
     }
 
     async getDecimal(input){

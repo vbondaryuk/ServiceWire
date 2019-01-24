@@ -15,4 +15,8 @@
     <ProjectReference Include="..\DemoCommon\DemoCommon.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="ApiExample\" />
+  </ItemGroup>
+
 </Project>
