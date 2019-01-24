@@ -21,7 +21,7 @@ namespace ServiceWire
         protected IZkRepository _zkRepository = new ZkNullRepository();
         private volatile bool _requireZk;
 
-        protected ConcurrentDictionary<string, int> _serviceKeys = new ConcurrentDictionary<string, int>(); 
+        protected ConcurrentDictionary<string, int> _serviceKeys = new ConcurrentDictionary<string, int>();
         protected ConcurrentDictionary<int, ServiceInstance> _services = new ConcurrentDictionary<int, ServiceInstance>();
         protected readonly ParameterTransferHelper _parameterTransferHelper;
 
@@ -115,7 +115,7 @@ namespace ServiceWire
                 throw;
             }
         }
-        
+
         /// <summary>
         /// Loads all methods from interfaces and assigns an identifier
         /// to each. These are later synchronized with the client.
@@ -174,9 +174,9 @@ namespace ServiceWire
                     parameterTypes[i] = parameters[i].ParameterType.FullName;
                 syncSyncInfos.Add(new MethodSyncInfo
                 {
-                    MethodIdent = kvp.Key, 
-                    MethodName = kvp.Value.Name, 
-                    MethodReturnType = kvp.Value.ReturnType.FullName, 
+                    MethodIdent = kvp.Key,
+                    MethodName = kvp.Value.Name,
+                    MethodReturnType = kvp.Value.ReturnType.FullName,
                     ParameterTypes = parameterTypes
                 });
             }
@@ -288,7 +288,7 @@ namespace ServiceWire
                 binWriter.Close();
             }
         }
-        
+
         private void ProcessSync(ZkSession session, BinaryReader binReader, BinaryWriter binWriter, Stopwatch sw)
         {
             var syncCat = "Sync";
@@ -389,10 +389,10 @@ namespace ServiceWire
                         object returnValue = method.Invoke(invokedInstance.SingletonInstance, parameters);
                         if (returnValue is Task task)
                         {
-	                        task.GetAwaiter().GetResult();
-	                        var prop = task.GetType().GetProperty("Result");
-	                        returnValue = prop?.GetValue(task);
-						}
+                            task.GetAwaiter().GetResult();
+                            var prop = task.GetType().GetProperty("Result");
+                            returnValue = prop?.GetValue(task);
+                        }
                         //the result to the client is the return value (null if void) and the input parameters
                         returnParameters = new object[1 + parameters.Length];
                         returnParameters[0] = returnValue;
@@ -402,13 +402,13 @@ namespace ServiceWire
                     catch (Exception ex)
                     {
                         //an exception was caught. Rethrow it client side
-                        returnParameters = new object[] {ex};
+                        returnParameters = new object[] { ex };
                         returnMessageType = MessageType.ThrowException;
                     }
 
                     //send the result back to the client
                     // (1) write the message type
-                    binWriter.Write((int) returnMessageType);
+                    binWriter.Write((int)returnMessageType);
 
                     // (2) write the return parameters
                     if (_requireZk)
@@ -440,10 +440,10 @@ namespace ServiceWire
                     }
                 }
                 else
-                    binWriter.Write((int) MessageType.UnknownMethod);
+                    binWriter.Write((int)MessageType.UnknownMethod);
             }
             else
-                binWriter.Write((int) MessageType.UnknownMethod);
+                binWriter.Write((int)MessageType.UnknownMethod);
 
             //flush
             binWriter.Flush();
@@ -463,57 +463,107 @@ namespace ServiceWire
 
         protected virtual void Dispose(bool disposing)
         {
-	        if (_disposed) return;
-	        _disposed = true; //prevent second call to Dispose
+            if (_disposed) return;
+            _disposed = true; //prevent second call to Dispose
             if (disposing)
             {
-	            if (_log is Logger log) log.FlushLog();
-	            if (_stats is Stats stat) stat.FlushLog();
-	            _isOpen = false;
-	            Continue = false;
-	            foreach (var instance in _services)
-	            {
-		            if (instance.Value.SingletonInstance is IDisposable disposable) disposable.Dispose();
-	            }
+                if (_log is Logger log) log.FlushLog();
+                if (_stats is Stats stat) stat.FlushLog();
+                _isOpen = false;
+                Continue = false;
+                foreach (var instance in _services)
+                {
+                    if (instance.Value.SingletonInstance is IDisposable disposable) disposable.Dispose();
+                }
             }
         }
 
         #endregion
     }
 
+    public class HttpHost : HostBase
+    {
+        private readonly ISerializer _serializer;
+
+        public HttpHost(ServiceInformationResolver serviceInformationResolver, ISerializer serializer)
+            : base(serviceInformationResolver)
+        {
+            _serializer = serializer;
+        }
+
+        public async Task ProcessRequest(Stream readStream, Stream writeStream)
+        {
+            var methodCall = await ReceiveParameters(readStream);
+            TryInvoke(methodCall, out InvocationResult invocationResult);
+            var bytes = _serializer.Serialize(invocationResult);
+            await writeStream.WriteAsync(bytes, 0, bytes.Length);
+        }
+
+        protected override void Invoke()
+        {
+            throw new NotImplementedException();
+        }
+
+
+        private async Task<MethodCallInformation> ReceiveParameters(Stream stream)
+        {
+            if (!(stream is MemoryStream memoryStream))
+            {
+                memoryStream = new MemoryStream();
+                await stream.CopyToAsync(memoryStream);
+            }
+
+            var bytes = memoryStream.ToArray();
+            var methodCall = _serializer.Deserialize<MethodCallInformation>(bytes);
+
+            return methodCall;
+        }
+    }
+
+    public class MethodCallInformation
+    {
+        public string ServiceKey { get; set; }
+        public int MethodKey { get; set; }
+        public object[] Parameters { get; set; }
+    }
 
 
     public abstract class HostBase
     {
-        protected readonly ServiceInformationResolver _serviceInformationResolver;
+        protected readonly ServiceInformationResolver ServiceInformationResolver;
+        protected ILog Log = new NullLogger();
+        protected IStats Stats = new NullStats();
 
         public HostBase(ServiceInformationResolver serviceInformationResolver)
         {
-            _serviceInformationResolver = serviceInformationResolver;
+            ServiceInformationResolver = serviceInformationResolver;
         }
 
-        private bool TryInvoke(string servicesKey, int methodKey, out InvocationResult invocationResult)
+        protected abstract void Invoke();
+
+        protected bool TryInvoke(MethodCallInformation methodCallInformation, out InvocationResult invocationResult)
         {
             invocationResult = new InvocationResult();
 
-            ServiceInstance serviceInstance = _serviceInformationResolver.Resolve(servicesKey);
+            ServiceInstance serviceInstance = ServiceInformationResolver.Resolve(methodCallInformation.ServiceKey);
             if (serviceInstance == null)
             {
                 invocationResult.ResultType = MessageType.UnknownMethod;
                 return false;
             }
 
-            if (!serviceInstance.InterfaceMethods.TryGetValue(methodKey, out MethodInfo method))
+            if (!serviceInstance.InterfaceMethods.TryGetValue(methodCallInformation.MethodKey, out MethodInfo method))
             {
                 invocationResult.ResultType = MessageType.UnknownMethod;
                 return false;
             }
 
-            serviceInstance.MethodParametersByRef.TryGetValue(methodKey, out bool[] isByRef);
+            serviceInstance.MethodParametersByRef.TryGetValue(methodCallInformation.MethodKey, out bool[] isByRef);
 
-            object[] parameters = ReceiveParameters();
             try
             {
+                var parameters = ReceiveParameters(methodCallInformation, method);
+
                 object returnValue = method.Invoke(serviceInstance.SingletonInstance, parameters);
                 if (returnValue is Task task)
                 {
@@ -524,8 +574,11 @@ namespace ServiceWire
                 //the result to the client is the return value (null if void) and the input parameters
                 invocationResult.Parameters = new object[1 + parameters.Length];
                 invocationResult.Parameters[0] = returnValue;
+
                 for (int i = 0; i < parameters.Length; i++)
                     invocationResult.Parameters[i + 1] = isByRef?[i] == true ? parameters[i] : null;
+
+                invocationResult.ResultType = MessageType.ReturnValues;
             }
             catch (Exception e)
             {
@@ -537,9 +590,23 @@ namespace ServiceWire
             return true;
         }
 
-        public abstract object[] ReceiveParameters();
+        private static object[] ReceiveParameters(MethodCallInformation methodCallInformation, MethodInfo method)
+        {
+            object[] parameters = methodCallInformation.Parameters;
+            var methodParameters = method.GetParameters();
+            for (int index = 0; index < parameters.Length; index++)
+            {
+                var parameter = parameters[index];
+                if (parameter.GetType() != methodParameters[index].ParameterType)
+                {
+                    parameters[index] = Convert.ChangeType(parameter, methodParameters[index].ParameterType);
+                }
+            }
 
-        private struct InvocationResult
+            return parameters;
+        }
+
+        protected struct InvocationResult
         {
             public object[] Parameters { get; set; }
 
@@ -574,6 +641,11 @@ namespace ServiceWire
         private readonly IInstanceActivator _activator;
         private readonly Dictionary<string, ServiceInstance> _services = new Dictionary<string, ServiceInstance>();
 
+        public ServiceInformationResolver()
+            : this(new InstanceActivator())
+        {
+        }
+
         public ServiceInformationResolver(IInstanceActivator activator)
         {
             this._activator = activator;
@@ -592,10 +664,10 @@ namespace ServiceWire
             //var instance = _activator.Create(typeof(TService));
 
             var serviceInstance = CreateMethodMap(interfaceType, instance);
-            _services.TryAdd(serviceKey, serviceInstance);
+            _services.Add(serviceKey, serviceInstance);
         }
 
-        public void AddService<TInterface, TService>() where TService: class, TInterface
+        public void AddService<TInterface, TService>() where TService : class, TInterface
         {
             var interfaceType = typeof(TInterface);
             var serviceType = typeof(TService);
@@ -610,7 +682,7 @@ namespace ServiceWire
             //var instance = _activator.Create(typeof(TService));
 
             var serviceInstance = CreateMethodMap(serviceType);
-            _services.TryAdd(serviceKey, serviceInstance);
+            _services.Add(serviceKey, serviceInstance);
         }
 
         public ServiceInstance Resolve(string key)
@@ -684,15 +756,13 @@ namespace ServiceWire
 
             var serviceSyncInfo = new ServiceSyncInfo
             {
-//                ServiceKeyIndex = keyIndex,
-//                CompressionThreshold = _compressionThreshold,
-//                UseCompression = _useCompression,
+                //                ServiceKeyIndex = keyIndex,
+                //                CompressionThreshold = _compressionThreshold,
+                //                UseCompression = _useCompression,
                 MethodInfos = syncSyncInfos.ToArray()
             };
             serviceInstanceMap.ServiceSyncInfo = serviceSyncInfo;
             return serviceInstanceMap;
         }
     }
-
-
 }
